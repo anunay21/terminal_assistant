@@ -23,16 +23,16 @@ An AI-powered terminal assistant that turns natural language task descriptions i
 ## Quick Start
 
 ```bash
-python main.py
+uv sync
+uv run main.py
 ```
 
 On first run, the assistant will:
 1. Collect a system profile (OS, shell, hardware)
 2. Install `uv` if not present
 3. Install Python 3.14t (free-threaded) via `uv`
-4. Create a virtual environment at `~/.terminal_assistant/venv`
-5. Install dependencies (`anthropic`, `httpx`, `rich`)
-6. Prompt you to choose an AI provider (Claude or Ollama) and supply the required credentials
+4. Install dependencies (`anthropic`, `httpx`, `rich`)
+5. Prompt you to choose an AI provider (Claude or Ollama) and supply the required credentials
 
 Subsequent runs re-exec directly inside the managed venv.
 
@@ -46,7 +46,7 @@ Set your API key interactively on first run, or via the environment:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-python main.py
+uv run main.py
 ```
 
 ### Ollama (local)
@@ -61,7 +61,7 @@ ollama serve
 ollama pull llama3.2
 
 # Run the assistant with Ollama
-python main.py --provider ollama
+uv run main.py --provider ollama
 ```
 
 Default Ollama settings:
