@@ -626,7 +626,19 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
     console.print(
         Panel(
             f"[bold green]AI Terminal Assistant[/bold green]  •  {provider_info}\n"
-            f"[dim]{os_display}  •  session log: {session_log}[/dim]",
+            f"[dim]{os_display}  •  session log: {session_log}[/dim]\n"
+            "\n[bold]Options:[/bold]\n"
+            "  [cyan]--dry-run[/cyan]              Show command without executing\n"
+            "  [cyan]--no-enhance[/cyan]           Skip prompt enhancement phase\n"
+            "  [cyan]--max-retries N[/cyan]        Max error-fix retries [dim](default: 3)[/dim]\n"
+            "  [cyan]--timeout SECS[/cyan]         Subprocess timeout in seconds [dim](default: 120)[/dim]\n"
+            "  [cyan]--log-file PATH[/cyan]        Custom session log file path\n"
+            "  [cyan]--stream-delay MS[/cyan]      Artificial token render delay in ms\n"
+            "  [cyan]--provider PROVIDER[/cyan]    Override AI provider: [dim]claude[/dim] | [dim]ollama[/dim]\n"
+            "  [cyan]--ollama-url URL[/cyan]       Ollama base URL [dim](default: http://localhost:11434)[/dim]\n"
+            "  [cyan]--ollama-model MODEL[/cyan]   Ollama model name [dim](default: llama3.2)[/dim]\n"
+            "  [cyan]--reconfigure[/cyan]          Re-run first-time setup\n"
+            "\n[dim]Type 'exit', 'quit', or 'q' to quit  •  Ctrl-C to force exit[/dim]",
             expand=False,
         )
     )
