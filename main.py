@@ -35,6 +35,9 @@ VENV_PYTHON = VENV_DIR / ("Scripts/python.exe" if _IS_WIN else "bin/python")
 PYTHON_TARGET = "3.14t"   # free-threaded build requested by spec
 MODEL         = "claude-opus-4-6"
 
+DEFAULT_OLLAMA_URL   = "http://localhost:11434"
+DEFAULT_OLLAMA_MODEL = "llama3.2"
+
 # ============================================================
 # SECTION 1 — Utilities (pure stdlib, always importable)
 # ============================================================
@@ -259,6 +262,45 @@ def setup_api_key(cfg: dict) -> dict:
     return cfg
 
 
+def setup_provider(cfg: dict) -> dict:
+    """Prompt user to choose AI provider."""
+    print()
+    print("  Choose AI provider:")
+    print("    1) Claude (Anthropic API)  — cloud, requires API key")
+    print("    2) Ollama                  — local, no API key needed")
+    while True:
+        try:
+            choice = input("  Enter choice [1/2] (default: 1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = "1"
+        if choice in ("", "1"):
+            cfg["provider"] = "claude"
+            break
+        elif choice == "2":
+            cfg["provider"] = "ollama"
+            break
+        print("  Please enter 1 or 2.")
+    return cfg
+
+
+def setup_ollama_config(cfg: dict) -> dict:
+    """Configure Ollama base URL and model."""
+    current_url   = cfg.get("ollama_url",   DEFAULT_OLLAMA_URL)
+    current_model = cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+    try:
+        url = input(f"  Ollama base URL [{current_url}]: ").strip() or current_url
+    except (EOFError, KeyboardInterrupt):
+        url = current_url
+    try:
+        model = input(f"  Ollama model    [{current_model}]: ").strip() or current_model
+    except (EOFError, KeyboardInterrupt):
+        model = current_model
+    cfg["ollama_url"]   = url
+    cfg["ollama_model"] = model
+    print(f"  [ok] Ollama configured: {url}  model={model}")
+    return cfg
+
+
 def run_bootstrap() -> None:
     """Run the full first-time setup sequence."""
     print()
@@ -287,9 +329,13 @@ def run_bootstrap() -> None:
         print("[error] Cannot install dependencies — aborting")
         sys.exit(1)
 
-    print("\n[5/5] API key configuration…")
+    print("\n[5/5] Provider & API key configuration…")
     cfg = load_config()
-    cfg = setup_api_key(cfg)
+    cfg = setup_provider(cfg)
+    if cfg.get("provider") == "ollama":
+        cfg = setup_ollama_config(cfg)
+    else:
+        cfg = setup_api_key(cfg)
     cfg["first_run_complete"] = True
     cfg["setup_date"] = datetime.now().isoformat()
     save_config(cfg)
@@ -312,17 +358,24 @@ def run_bootstrap() -> None:
 def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
     # These imports are only available after the venv is set up
     import anthropic                          # noqa: PLC0415
+    import httpx                              # noqa: PLC0415
     from rich.console import Console          # noqa: PLC0415
     from rich.panel import Panel              # noqa: PLC0415
 
     console = Console()
 
-    api_key = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        console.print("[red]No API key found. Run with --reconfigure.[/red]")
-        sys.exit(1)
+    # ── Provider selection ───────────────────────────────────────────────────
+    provider     = args.provider or cfg.get("provider", "claude")
+    ollama_url   = args.ollama_url   or cfg.get("ollama_url",   DEFAULT_OLLAMA_URL)
+    ollama_model = args.ollama_model or cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+    client       = None
 
-    client = anthropic.Anthropic(api_key=api_key)
+    if provider == "claude":
+        api_key = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            console.print("[red]No API key found. Run with --reconfigure.[/red]")
+            sys.exit(1)
+        client = anthropic.Anthropic(api_key=api_key)
 
     # ── Queues & synchronisation ────────────────────────────────────────────
     token_q: queue.Queue = queue.Queue()   # Thread 2 → Thread 1
@@ -378,9 +431,9 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
         "• Keep all explanations concise."
     )
 
-    # ── Thread 2 — Claude streaming ─────────────────────────────────────────
+    # ── Thread 2 — AI streaming (Claude or Ollama) ──────────────────────────
     def _stream_claude(messages: list[dict]) -> None:
-        """Background thread: SSE stream → token_q."""
+        """Background thread: Claude SSE stream → token_q."""
         try:
             with client.messages.stream(
                 model=MODEL,
@@ -394,9 +447,38 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
                         break
                     if event.type == "content_block_delta":
                         delta = event.delta
-                        if hasattr(delta, "text"):          # text_delta only
+                        if hasattr(delta, "text"):
                             token_q.put(("tok", delta.text))
-                        # thinking_delta blocks are silently skipped
+            token_q.put(("done", None))
+        except Exception as exc:
+            token_q.put(("err", str(exc)))
+
+    def _stream_ollama(messages: list[dict]) -> None:
+        """Background thread: Ollama streaming chat → token_q."""
+        try:
+            payload = {
+                "model": ollama_model,
+                "messages": [{"role": "system", "content": SYSTEM}]
+                           + [{"role": m["role"], "content": m["content"]}
+                              for m in messages],
+                "stream": True,
+            }
+            with httpx.stream(
+                "POST", f"{ollama_url}/api/chat",
+                json=payload, timeout=120,
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if cancel.is_set():
+                        break
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    text = (data.get("message") or {}).get("content", "")
+                    if text:
+                        token_q.put(("tok", text))
+                    if data.get("done"):
+                        break
             token_q.put(("done", None))
         except Exception as exc:
             token_q.put(("err", str(exc)))
@@ -407,9 +489,10 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
         full accumulated text.  Tokens are written to stdout in real time.
         """
         cancel.clear()
+        target = _stream_claude if provider == "claude" else _stream_ollama
         t = threading.Thread(
-            target=_stream_claude, args=(messages,),
-            name="claude-stream", daemon=True,
+            target=target, args=(messages,),
+            name="ai-stream", daemon=True,
         )
         t.start()
 
@@ -422,7 +505,7 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
                 kind, data = token_q.get(timeout=60)
             except queue.Empty:
                 sys.stdout.write("\n")
-                console.print("[red][timeout waiting for Claude][/red]")
+                console.print("[red][timeout waiting for AI response][/red]")
                 break
             if kind == "tok":
                 # Mid-stream: append to rolling buffer for command extraction
@@ -502,9 +585,13 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
     os_display = (profile.get("os_info") or {}).get(
         "PRETTY_NAME", f"{profile.get('platform', 'system')}"
     )
+    if provider == "claude":
+        provider_info = f"Claude {MODEL} + adaptive thinking"
+    else:
+        provider_info = f"Ollama {ollama_model}  ({ollama_url})"
     console.print(
         Panel(
-            f"[bold green]AI Terminal Assistant[/bold green]  •  {MODEL} + adaptive thinking\n"
+            f"[bold green]AI Terminal Assistant[/bold green]  •  {provider_info}\n"
             f"[dim]{os_display}  •  session log: {session_log}[/dim]",
             expand=False,
         )
@@ -562,13 +649,13 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
                     "3. Note any risks or side effects."
                 ),
             }],
-            "Claude",
+            "AI",
         )
         log("generated", text=gen_resp)
 
         command = extract_command(gen_resp)
         if not command:
-            console.print("[yellow]No command found in Claude's response.[/yellow]")
+            console.print("[yellow]No command found in AI response.[/yellow]")
             continue
 
         console.print(f"\n[bold]Command:[/bold] [cyan]{command}[/cyan]")
@@ -623,7 +710,7 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
                         "Diagnose briefly, then provide a corrected ```bash command."
                     ),
                 }],
-                "Claude (fixing)",
+                "AI (fixing)",
             )
             log("fix_response", text=fix_resp)
 
@@ -681,9 +768,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--timeout",      type=int, default=120, metavar="SECS",
                    help="Subprocess timeout in seconds")
     p.add_argument("--reconfigure",  action="store_true",
-                   help="Re-run first-time setup")
+                   help="Re-run first-time setup (including provider selection)")
     p.add_argument("--stream-delay", type=int, default=0, metavar="MS",
                    help="Artificial token render delay in milliseconds")
+    p.add_argument("--provider",     choices=["claude", "ollama"], metavar="PROVIDER",
+                   help="Override provider for this session (claude or ollama)")
+    p.add_argument("--ollama-url",   metavar="URL",
+                   help=f"Ollama base URL (default: {DEFAULT_OLLAMA_URL})")
+    p.add_argument("--ollama-model", metavar="MODEL",
+                   help=f"Ollama model name (default: {DEFAULT_OLLAMA_MODEL})")
     return p.parse_args()
 
 
