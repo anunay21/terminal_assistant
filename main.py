@@ -633,8 +633,9 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
 
     def _sigint(sig, frame) -> None:  # noqa: ANN001
         cancel.set()
-        sys.stdout.write("\n[Ctrl-C]\n")
+        sys.stdout.write("\n[Ctrl-C] Exiting...\n")
         sys.stdout.flush()
+        sys.exit(0)
 
     signal.signal(signal.SIGINT, _sigint)
 
