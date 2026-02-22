@@ -7,6 +7,7 @@ Self-bootstrapping | Python 3.14t (free-threaded) | uv | Claude Opus 4.6
 from __future__ import annotations
 
 import argparse
+import copy
 import getpass
 import json
 import os
@@ -515,6 +516,10 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
         except Exception as exc:
             token_q.put(("err", str(exc)))
 
+    # Mutable containers so per-turn overrides are visible inside closures
+    _cur_delay   = [args.stream_delay]
+    _cur_timeout = [args.timeout]
+
     def stream(messages: list[dict], label: str) -> str:
         """
         Spawn Thread 2, drain token_q in Thread 1 (UI), and return the
@@ -544,8 +549,8 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
                 buf += data
                 sys.stdout.write(data)
                 sys.stdout.flush()
-                if args.stream_delay:
-                    time.sleep(args.stream_delay / 1000)
+                if _cur_delay[0]:
+                    time.sleep(_cur_delay[0] / 1000)
             elif kind == "done":
                 sys.stdout.write("\n")
                 sys.stdout.flush()
@@ -596,8 +601,8 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
             )
             t_out.start()
             t_err.start()
-            t_out.join(timeout=args.timeout)
-            t_err.join(timeout=args.timeout)
+            t_out.join(timeout=_cur_timeout[0])
+            t_err.join(timeout=_cur_timeout[0])
             rc = proc.wait(timeout=10)
 
         except subprocess.TimeoutExpired:
@@ -660,16 +665,78 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
             break
 
         cancel.clear()
+
+        # ── Per-turn inline flag parsing ─────────────────────────────────────
+        # Flags may be embedded in the user's input, e.g. "list files --dry-run"
+        turn_args = copy.copy(args)
+        _parts = user_in.split()
+        _remaining: list[str] = []
+        _reconfigure_requested = False
+        _i = 0
+        while _i < len(_parts):
+            _tok = _parts[_i]
+            if _tok == "--dry-run":
+                turn_args.dry_run = True
+                _i += 1
+            elif _tok == "--no-enhance":
+                turn_args.no_enhance = True
+                _i += 1
+            elif _tok == "--reconfigure":
+                _reconfigure_requested = True
+                _i += 1
+            elif _tok in ("--max-retries", "--timeout", "--stream-delay") and _i + 1 < len(_parts):
+                try:
+                    _val = int(_parts[_i + 1])
+                    setattr(turn_args, _tok.lstrip("-").replace("-", "_"), _val)
+                    _i += 2
+                except ValueError:
+                    _remaining.append(_tok)
+                    _i += 1
+            else:
+                _remaining.append(_tok)
+                _i += 1
+        user_in = " ".join(_remaining)
+        _cur_delay[0]   = turn_args.stream_delay
+        _cur_timeout[0] = turn_args.timeout
+
+        # ── Inline reconfigure ───────────────────────────────────────────────
+        if _reconfigure_requested:
+            _cfg2 = load_config()
+            _cfg2 = setup_provider(_cfg2)
+            if _cfg2.get("provider") == "ollama":
+                _cfg2 = setup_ollama_config(_cfg2)
+            else:
+                _cfg2 = setup_api_key(_cfg2)
+            save_config(_cfg2)
+            # Update live session variables so the running app uses new settings
+            provider     = _cfg2.get("provider", "claude")
+            ollama_url   = _cfg2.get("ollama_url",   DEFAULT_OLLAMA_URL)
+            ollama_model = _cfg2.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+            if provider == "claude":
+                _ak = _cfg2.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+                if _ak:
+                    os.environ["ANTHROPIC_API_KEY"] = _ak
+                    client = anthropic.Anthropic(api_key=_ak)
+            console.print(f"[green]Reconfigured.[/green] Now using: [cyan]{provider}[/cyan]")
+            if not user_in:
+                continue
+
+        if not user_in:
+            continue
+
         log("user_input", text=user_in)
 
         # ── Phase 1: Prompt enhancement ─────────────────────────────────────
-        if not args.no_enhance:
+        if not turn_args.no_enhance:
             enh_resp = stream(
                 [{
                     "role": "user",
                     "content": (
                         "Refine this terminal task into a precise 1–2 sentence technical "
-                        "description. Do NOT generate a command yet.\n\n"
+                        "description tailored to the current system. Include relevant system "
+                        "details (OS, shell, architecture) where helpful. "
+                        "Do NOT generate a command yet.\n\n"
+                        f"System context:\n{_profile_ctx}\n\n"
                         f"Task: {user_in}"
                     ),
                 }],
@@ -707,7 +774,7 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
 
         console.print(f"\n[bold]Command:[/bold] [cyan]{command}[/cyan]")
 
-        if args.dry_run:
+        if turn_args.dry_run:
             log("dry_run", command=command)
             console.print("[dim](dry-run — not executing)[/dim]")
             continue
@@ -725,9 +792,9 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
         success = False
         stdout  = ""
 
-        for attempt in range(args.max_retries + 1):
+        for attempt in range(turn_args.max_retries + 1):
             if attempt:
-                console.print(f"\n[yellow]Retry {attempt}/{args.max_retries}[/yellow]")
+                console.print(f"\n[yellow]Retry {attempt}/{turn_args.max_retries}[/yellow]")
 
             rc, stdout, stderr = execute(command)
             console.print(f"[dim]{'─' * 52}[/dim]")
@@ -740,7 +807,7 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
             log("exec_failed", command=command, rc=rc, attempt=attempt,
                 stderr=stderr[:500])
 
-            if attempt >= args.max_retries:
+            if attempt >= turn_args.max_retries:
                 console.print("[red]Max retries reached.[/red]")
                 break
 
@@ -832,7 +899,8 @@ def main() -> None:
     cfg  = load_config()
 
     # ── Bootstrap if needed ──────────────────────────────────────────────────
-    if args.reconfigure or not cfg.get("first_run_complete"):
+    if (args.reconfigure or not cfg.get("first_run_complete")) and not os.environ.get("_TA_BOOTSTRAPPED"):
+        os.environ["_TA_BOOTSTRAPPED"] = "1"
         if args.reconfigure:
             cfg.pop("first_run_complete", None)
         run_bootstrap()
