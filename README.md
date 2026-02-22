@@ -4,13 +4,14 @@ An AI-powered terminal assistant that turns natural language task descriptions i
 
 ## Features
 
-- **Prompt enhancement** — refines your natural language input into a precise technical description before generating a command
+- **System-aware prompt enhancement** — refines your natural language input into a precise, system-tailored technical description (OS, shell, architecture included) before generating a command
 - **Command generation** — produces a single, explained shell command via streaming
 - **Automatic error recovery** — on failure, the AI diagnoses the error and suggests a corrected command (up to N retries)
 - **Success summary** — after execution, provides a plain-English summary of what was accomplished
 - **Session logging** — every interaction is written to a JSONL log file in `~/.terminal_assistant/logs/`
 - **Self-bootstrapping** — installs `uv`, Python 3.14t (free-threaded), and required dependencies on first run
 - **Multiple AI providers** — choose between Claude (Anthropic API) or Ollama (local inference)
+- **Inline flags** — control behaviour per-task by appending flags directly to your prompt
 
 ## Requirements
 
@@ -92,11 +93,33 @@ usage: main.py [-h] [--dry-run] [--max-retries N] [--no-enhance]
 | `--no-enhance` | off | Skip the prompt enhancement phase |
 | `--log-file PATH` | auto | Custom session log file path |
 | `--timeout SECS` | 120 | Subprocess timeout in seconds |
-| `--reconfigure` | off | Re-run first-time setup |
+| `--reconfigure` | off | Re-run provider & credential setup |
 | `--stream-delay MS` | 0 | Artificial token render delay (milliseconds) |
 | `--provider` | saved config | AI provider to use (`claude` or `ollama`) |
 | `--ollama-url URL` | saved config | Ollama server URL |
 | `--ollama-model MODEL` | saved config | Ollama model name |
+
+### Inline flags
+
+All per-task flags can be appended directly to your prompt — no need to restart the assistant:
+
+```
+[>] Task (or 'exit'): find all log files older than 7 days --dry-run
+[>] Task (or 'exit'): compress the Downloads folder --timeout 300 --max-retries 1
+[>] Task (or 'exit'): list running docker containers --no-enhance
+```
+
+`--reconfigure` can also be typed inline to switch providers or update credentials without restarting:
+
+```
+[>] Task (or 'exit'): --reconfigure
+```
+
+It can be combined with a task — reconfiguration runs first, then the task proceeds with the new settings:
+
+```
+[>] Task (or 'exit'): show disk usage --reconfigure
+```
 
 ### Example session
 
@@ -104,23 +127,38 @@ usage: main.py [-h] [--dry-run] [--max-retries N] [--no-enhance]
 [>] Task (or 'exit'): find all files larger than 100MB in my home directory
 
 Enhancing:
-  List all files in the home directory tree that exceed 100 MB in size, ...
+  On macOS 15.2 (arm64) with zsh, recursively search the home directory
+  for files exceeding 100 MB and display their sizes and paths.
 
-Enhanced: List all files in the home directory tree...
+Enhanced: On macOS 15.2 (arm64) with zsh, recursively search...
 Use enhanced prompt? [Y/n]: y
 
 AI:
   This command uses `find` to recursively search your home directory...
   ```bash
-  find ~ -type f -size +100M
+  find ~ -type f -size +100M -exec ls -lh {} \;
   ```
 
-Command: find ~ -type f -size +100M
+Command: find ~ -type f -size +100M -exec ls -lh {} \;
 Execute? [Y/n]: y
 ...
 Summary:
   Successfully listed all files exceeding 100 MB in your home directory.
 ```
+
+## Reconfiguring
+
+To switch providers or update credentials at any time — either at startup or from within a running session:
+
+```bash
+# CLI flag (before starting)
+python main.py --reconfigure
+
+# Inline (from within the running assistant)
+[>] Task (or 'exit'): --reconfigure
+```
+
+Only the provider/credential step is repeated — the venv and dependencies are left untouched.
 
 ## File Layout
 
@@ -146,11 +184,3 @@ Summary:
 | Variable | Description |
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key (alternative to interactive prompt / saved config) |
-
-## Reconfiguring
-
-To reset setup, switch providers, or update credentials:
-
-```bash
-python main.py --reconfigure
-```
