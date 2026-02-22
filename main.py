@@ -86,6 +86,16 @@ def collect_system_profile() -> dict:
     p["home"]             = str(Path.home())
     p["shell"]            = os.environ.get("SHELL") or shutil.which("bash") or "sh"
 
+    # Human-readable OS type (resolved further below for Linux distros)
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        mac_ver = platform.mac_ver()[0]
+        p["os_type"] = f"macOS {mac_ver}" if mac_ver else "macOS"
+    elif sys_name == "Windows":
+        p["os_type"] = f"Windows {platform.release()}"
+    else:
+        p["os_type"] = f"Linux {platform.release()}"
+
     # Ubuntu / Linux distro info
     if Path("/etc/os-release").exists():
         info: dict = {}
@@ -94,6 +104,11 @@ def collect_system_profile() -> dict:
                 k, _, v = line.partition("=")
                 info[k] = v.strip('"')
         p["os_info"] = info
+        # Refine os_type from distro name (e.g. "Ubuntu 22.04.3 LTS")
+        if "PRETTY_NAME" in info:
+            p["os_type"] = info["PRETTY_NAME"]
+        elif "NAME" in info:
+            p["os_type"] = f"{info['NAME']} {info.get('VERSION', '')}".strip()
 
     # Timezone
     try:
@@ -410,13 +425,30 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
 
     # ── System prompt ───────────────────────────────────────────────────────
     os_name = (
-        (profile.get("os_info") or {}).get("PRETTY_NAME")
+        profile.get("os_type")
+        or (profile.get("os_info") or {}).get("PRETTY_NAME")
         or f"{profile.get('platform', 'Linux')} {profile.get('platform_release', '')}"
     )
+
+    # Build a rich system context from the captured profile
+    _hw = f"CPU: {profile['cpu_cores']} cores" if "cpu_cores" in profile else ""
+    if "memory_kb" in profile:
+        _hw += f"  |  RAM: {round(profile['memory_kb'] / 1024 / 1024, 1)} GB"
+    _pkgs = [pm for pm, ok in (profile.get("package_managers") or {}).items() if ok]
+
+    _profile_lines = [
+        f"OS: {os_name}  |  Arch: {profile.get('machine', '?')}  |  Shell: {profile.get('shell', 'bash')}",
+        f"User: {profile.get('user', '?')}@{profile.get('hostname', '?')}  |  Timezone: {profile.get('timezone', 'unknown')}",
+    ]
+    if _hw:
+        _profile_lines.append(_hw)
+    if _pkgs:
+        _profile_lines.append(f"Package managers: {', '.join(_pkgs)}")
+    _profile_ctx = "\n".join(_profile_lines)
+
     SYSTEM = (
         f"You are an AI-powered terminal assistant.\n"
-        f"OS: {os_name}  |  Arch: {profile.get('machine', '?')}  "
-        f"|  Shell: {profile.get('shell', 'bash')}\n\n"
+        f"{_profile_ctx}\n\n"
         "Workflow:\n"
         "1. Prompt enhancement — refine the user's request into a precise 1–2 sentence "
         "technical description. Do NOT generate a command in this phase.\n"
@@ -582,8 +614,10 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
         return rc, stdout, stderr
 
     # ── Main interaction loop (Thread 1 — UI) ───────────────────────────────
-    os_display = (profile.get("os_info") or {}).get(
-        "PRETTY_NAME", f"{profile.get('platform', 'system')}"
+    os_display = (
+        profile.get("os_type")
+        or (profile.get("os_info") or {}).get("PRETTY_NAME")
+        or profile.get("platform", "system")
     )
     if provider == "claude":
         provider_info = f"Claude {MODEL} + adaptive thinking"
