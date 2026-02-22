@@ -7,6 +7,7 @@ Self-bootstrapping | Python 3.14t (free-threaded) | uv | Claude Opus 4.6
 from __future__ import annotations
 
 import argparse
+import copy
 import getpass
 import json
 import os
@@ -34,6 +35,9 @@ VENV_PYTHON = VENV_DIR / ("Scripts/python.exe" if _IS_WIN else "bin/python")
 
 PYTHON_TARGET = "3.14t"   # free-threaded build requested by spec
 MODEL         = "claude-opus-4-6"
+
+DEFAULT_OLLAMA_URL   = "http://localhost:11434"
+DEFAULT_OLLAMA_MODEL = "llama3.2"
 
 # ============================================================
 # SECTION 1 — Utilities (pure stdlib, always importable)
@@ -83,6 +87,16 @@ def collect_system_profile() -> dict:
     p["home"]             = str(Path.home())
     p["shell"]            = os.environ.get("SHELL") or shutil.which("bash") or "sh"
 
+    # Human-readable OS type (resolved further below for Linux distros)
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        mac_ver = platform.mac_ver()[0]
+        p["os_type"] = f"macOS {mac_ver}" if mac_ver else "macOS"
+    elif sys_name == "Windows":
+        p["os_type"] = f"Windows {platform.release()}"
+    else:
+        p["os_type"] = f"Linux {platform.release()}"
+
     # Ubuntu / Linux distro info
     if Path("/etc/os-release").exists():
         info: dict = {}
@@ -91,6 +105,11 @@ def collect_system_profile() -> dict:
                 k, _, v = line.partition("=")
                 info[k] = v.strip('"')
         p["os_info"] = info
+        # Refine os_type from distro name (e.g. "Ubuntu 22.04.3 LTS")
+        if "PRETTY_NAME" in info:
+            p["os_type"] = info["PRETTY_NAME"]
+        elif "NAME" in info:
+            p["os_type"] = f"{info['NAME']} {info.get('VERSION', '')}".strip()
 
     # Timezone
     try:
@@ -259,6 +278,45 @@ def setup_api_key(cfg: dict) -> dict:
     return cfg
 
 
+def setup_provider(cfg: dict) -> dict:
+    """Prompt user to choose AI provider."""
+    print()
+    print("  Choose AI provider:")
+    print("    1) Claude (Anthropic API)  — cloud, requires API key")
+    print("    2) Ollama                  — local, no API key needed")
+    while True:
+        try:
+            choice = input("  Enter choice [1/2] (default: 1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = "1"
+        if choice in ("", "1"):
+            cfg["provider"] = "claude"
+            break
+        elif choice == "2":
+            cfg["provider"] = "ollama"
+            break
+        print("  Please enter 1 or 2.")
+    return cfg
+
+
+def setup_ollama_config(cfg: dict) -> dict:
+    """Configure Ollama base URL and model."""
+    current_url   = cfg.get("ollama_url",   DEFAULT_OLLAMA_URL)
+    current_model = cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+    try:
+        url = input(f"  Ollama base URL [{current_url}]: ").strip() or current_url
+    except (EOFError, KeyboardInterrupt):
+        url = current_url
+    try:
+        model = input(f"  Ollama model    [{current_model}]: ").strip() or current_model
+    except (EOFError, KeyboardInterrupt):
+        model = current_model
+    cfg["ollama_url"]   = url
+    cfg["ollama_model"] = model
+    print(f"  [ok] Ollama configured: {url}  model={model}")
+    return cfg
+
+
 def run_bootstrap() -> None:
     """Run the full first-time setup sequence."""
     print()
@@ -287,9 +345,13 @@ def run_bootstrap() -> None:
         print("[error] Cannot install dependencies — aborting")
         sys.exit(1)
 
-    print("\n[5/5] API key configuration…")
+    print("\n[5/5] Provider & API key configuration…")
     cfg = load_config()
-    cfg = setup_api_key(cfg)
+    cfg = setup_provider(cfg)
+    if cfg.get("provider") == "ollama":
+        cfg = setup_ollama_config(cfg)
+    else:
+        cfg = setup_api_key(cfg)
     cfg["first_run_complete"] = True
     cfg["setup_date"] = datetime.now().isoformat()
     save_config(cfg)
@@ -312,17 +374,24 @@ def run_bootstrap() -> None:
 def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
     # These imports are only available after the venv is set up
     import anthropic                          # noqa: PLC0415
+    import httpx                              # noqa: PLC0415
     from rich.console import Console          # noqa: PLC0415
     from rich.panel import Panel              # noqa: PLC0415
 
     console = Console()
 
-    api_key = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        console.print("[red]No API key found. Run with --reconfigure.[/red]")
-        sys.exit(1)
+    # ── Provider selection ───────────────────────────────────────────────────
+    provider     = args.provider or cfg.get("provider", "claude")
+    ollama_url   = args.ollama_url   or cfg.get("ollama_url",   DEFAULT_OLLAMA_URL)
+    ollama_model = args.ollama_model or cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+    client       = None
 
-    client = anthropic.Anthropic(api_key=api_key)
+    if provider == "claude":
+        api_key = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            console.print("[red]No API key found. Run with --reconfigure.[/red]")
+            sys.exit(1)
+        client = anthropic.Anthropic(api_key=api_key)
 
     # ── Queues & synchronisation ────────────────────────────────────────────
     token_q: queue.Queue = queue.Queue()   # Thread 2 → Thread 1
@@ -357,13 +426,30 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
 
     # ── System prompt ───────────────────────────────────────────────────────
     os_name = (
-        (profile.get("os_info") or {}).get("PRETTY_NAME")
+        profile.get("os_type")
+        or (profile.get("os_info") or {}).get("PRETTY_NAME")
         or f"{profile.get('platform', 'Linux')} {profile.get('platform_release', '')}"
     )
+
+    # Build a rich system context from the captured profile
+    _hw = f"CPU: {profile['cpu_cores']} cores" if "cpu_cores" in profile else ""
+    if "memory_kb" in profile:
+        _hw += f"  |  RAM: {round(profile['memory_kb'] / 1024 / 1024, 1)} GB"
+    _pkgs = [pm for pm, ok in (profile.get("package_managers") or {}).items() if ok]
+
+    _profile_lines = [
+        f"OS: {os_name}  |  Arch: {profile.get('machine', '?')}  |  Shell: {profile.get('shell', 'bash')}",
+        f"User: {profile.get('user', '?')}@{profile.get('hostname', '?')}  |  Timezone: {profile.get('timezone', 'unknown')}",
+    ]
+    if _hw:
+        _profile_lines.append(_hw)
+    if _pkgs:
+        _profile_lines.append(f"Package managers: {', '.join(_pkgs)}")
+    _profile_ctx = "\n".join(_profile_lines)
+
     SYSTEM = (
         f"You are an AI-powered terminal assistant.\n"
-        f"OS: {os_name}  |  Arch: {profile.get('machine', '?')}  "
-        f"|  Shell: {profile.get('shell', 'bash')}\n\n"
+        f"{_profile_ctx}\n\n"
         "Workflow:\n"
         "1. Prompt enhancement — refine the user's request into a precise 1–2 sentence "
         "technical description. Do NOT generate a command in this phase.\n"
@@ -378,9 +464,9 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
         "• Keep all explanations concise."
     )
 
-    # ── Thread 2 — Claude streaming ─────────────────────────────────────────
+    # ── Thread 2 — AI streaming (Claude or Ollama) ──────────────────────────
     def _stream_claude(messages: list[dict]) -> None:
-        """Background thread: SSE stream → token_q."""
+        """Background thread: Claude SSE stream → token_q."""
         try:
             with client.messages.stream(
                 model=MODEL,
@@ -394,12 +480,45 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
                         break
                     if event.type == "content_block_delta":
                         delta = event.delta
-                        if hasattr(delta, "text"):          # text_delta only
+                        if hasattr(delta, "text"):
                             token_q.put(("tok", delta.text))
-                        # thinking_delta blocks are silently skipped
             token_q.put(("done", None))
         except Exception as exc:
             token_q.put(("err", str(exc)))
+
+    def _stream_ollama(messages: list[dict]) -> None:
+        """Background thread: Ollama streaming chat → token_q."""
+        try:
+            payload = {
+                "model": ollama_model,
+                "messages": [{"role": "system", "content": SYSTEM}]
+                           + [{"role": m["role"], "content": m["content"]}
+                              for m in messages],
+                "stream": True,
+            }
+            with httpx.stream(
+                "POST", f"{ollama_url}/api/chat",
+                json=payload, timeout=120,
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if cancel.is_set():
+                        break
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    text = (data.get("message") or {}).get("content", "")
+                    if text:
+                        token_q.put(("tok", text))
+                    if data.get("done"):
+                        break
+            token_q.put(("done", None))
+        except Exception as exc:
+            token_q.put(("err", str(exc)))
+
+    # Mutable containers so per-turn overrides are visible inside closures
+    _cur_delay   = [args.stream_delay]
+    _cur_timeout = [args.timeout]
 
     def stream(messages: list[dict], label: str) -> str:
         """
@@ -407,9 +526,10 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
         full accumulated text.  Tokens are written to stdout in real time.
         """
         cancel.clear()
+        target = _stream_claude if provider == "claude" else _stream_ollama
         t = threading.Thread(
-            target=_stream_claude, args=(messages,),
-            name="claude-stream", daemon=True,
+            target=target, args=(messages,),
+            name="ai-stream", daemon=True,
         )
         t.start()
 
@@ -422,15 +542,15 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
                 kind, data = token_q.get(timeout=60)
             except queue.Empty:
                 sys.stdout.write("\n")
-                console.print("[red][timeout waiting for Claude][/red]")
+                console.print("[red][timeout waiting for AI response][/red]")
                 break
             if kind == "tok":
                 # Mid-stream: append to rolling buffer for command extraction
                 buf += data
                 sys.stdout.write(data)
                 sys.stdout.flush()
-                if args.stream_delay:
-                    time.sleep(args.stream_delay / 1000)
+                if _cur_delay[0]:
+                    time.sleep(_cur_delay[0] / 1000)
             elif kind == "done":
                 sys.stdout.write("\n")
                 sys.stdout.flush()
@@ -481,8 +601,8 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
             )
             t_out.start()
             t_err.start()
-            t_out.join(timeout=args.timeout)
-            t_err.join(timeout=args.timeout)
+            t_out.join(timeout=_cur_timeout[0])
+            t_err.join(timeout=_cur_timeout[0])
             rc = proc.wait(timeout=10)
 
         except subprocess.TimeoutExpired:
@@ -499,21 +619,40 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
         return rc, stdout, stderr
 
     # ── Main interaction loop (Thread 1 — UI) ───────────────────────────────
-    os_display = (profile.get("os_info") or {}).get(
-        "PRETTY_NAME", f"{profile.get('platform', 'system')}"
+    os_display = (
+        profile.get("os_type")
+        or (profile.get("os_info") or {}).get("PRETTY_NAME")
+        or profile.get("platform", "system")
     )
+    if provider == "claude":
+        provider_info = f"Claude {MODEL} + adaptive thinking"
+    else:
+        provider_info = f"Ollama {ollama_model}  ({ollama_url})"
     console.print(
         Panel(
-            f"[bold green]AI Terminal Assistant[/bold green]  •  {MODEL} + adaptive thinking\n"
-            f"[dim]{os_display}  •  session log: {session_log}[/dim]",
+            f"[bold green]AI Terminal Assistant[/bold green]  •  {provider_info}\n"
+            f"[dim]{os_display}  •  session log: {session_log}[/dim]\n"
+            "\n[bold]Options:[/bold]\n"
+            "  [cyan]--dry-run[/cyan]              Show command without executing\n"
+            "  [cyan]--no-enhance[/cyan]           Skip prompt enhancement phase\n"
+            "  [cyan]--max-retries N[/cyan]        Max error-fix retries [dim](default: 3)[/dim]\n"
+            "  [cyan]--timeout SECS[/cyan]         Subprocess timeout in seconds [dim](default: 120)[/dim]\n"
+            "  [cyan]--log-file PATH[/cyan]        Custom session log file path\n"
+            "  [cyan]--stream-delay MS[/cyan]      Artificial token render delay in ms\n"
+            "  [cyan]--provider PROVIDER[/cyan]    Override AI provider: [dim]claude[/dim] | [dim]ollama[/dim]\n"
+            "  [cyan]--ollama-url URL[/cyan]       Ollama base URL [dim](default: http://localhost:11434)[/dim]\n"
+            "  [cyan]--ollama-model MODEL[/cyan]   Ollama model name [dim](default: llama3.2)[/dim]\n"
+            "  [cyan]--reconfigure[/cyan]          Re-run first-time setup\n"
+            "\n[dim]Type 'exit', 'quit', or 'q' to quit  •  Ctrl-C to force exit[/dim]",
             expand=False,
         )
     )
 
     def _sigint(sig, frame) -> None:  # noqa: ANN001
         cancel.set()
-        sys.stdout.write("\n[Ctrl-C]\n")
+        sys.stdout.write("\n[Ctrl-C] Exiting...\n")
         sys.stdout.flush()
+        sys.exit(0)
 
     signal.signal(signal.SIGINT, _sigint)
 
@@ -526,16 +665,78 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
             break
 
         cancel.clear()
+
+        # ── Per-turn inline flag parsing ─────────────────────────────────────
+        # Flags may be embedded in the user's input, e.g. "list files --dry-run"
+        turn_args = copy.copy(args)
+        _parts = user_in.split()
+        _remaining: list[str] = []
+        _reconfigure_requested = False
+        _i = 0
+        while _i < len(_parts):
+            _tok = _parts[_i]
+            if _tok == "--dry-run":
+                turn_args.dry_run = True
+                _i += 1
+            elif _tok == "--no-enhance":
+                turn_args.no_enhance = True
+                _i += 1
+            elif _tok == "--reconfigure":
+                _reconfigure_requested = True
+                _i += 1
+            elif _tok in ("--max-retries", "--timeout", "--stream-delay") and _i + 1 < len(_parts):
+                try:
+                    _val = int(_parts[_i + 1])
+                    setattr(turn_args, _tok.lstrip("-").replace("-", "_"), _val)
+                    _i += 2
+                except ValueError:
+                    _remaining.append(_tok)
+                    _i += 1
+            else:
+                _remaining.append(_tok)
+                _i += 1
+        user_in = " ".join(_remaining)
+        _cur_delay[0]   = turn_args.stream_delay
+        _cur_timeout[0] = turn_args.timeout
+
+        # ── Inline reconfigure ───────────────────────────────────────────────
+        if _reconfigure_requested:
+            _cfg2 = load_config()
+            _cfg2 = setup_provider(_cfg2)
+            if _cfg2.get("provider") == "ollama":
+                _cfg2 = setup_ollama_config(_cfg2)
+            else:
+                _cfg2 = setup_api_key(_cfg2)
+            save_config(_cfg2)
+            # Update live session variables so the running app uses new settings
+            provider     = _cfg2.get("provider", "claude")
+            ollama_url   = _cfg2.get("ollama_url",   DEFAULT_OLLAMA_URL)
+            ollama_model = _cfg2.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+            if provider == "claude":
+                _ak = _cfg2.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+                if _ak:
+                    os.environ["ANTHROPIC_API_KEY"] = _ak
+                    client = anthropic.Anthropic(api_key=_ak)
+            console.print(f"[green]Reconfigured.[/green] Now using: [cyan]{provider}[/cyan]")
+            if not user_in:
+                continue
+
+        if not user_in:
+            continue
+
         log("user_input", text=user_in)
 
         # ── Phase 1: Prompt enhancement ─────────────────────────────────────
-        if not args.no_enhance:
+        if not turn_args.no_enhance:
             enh_resp = stream(
                 [{
                     "role": "user",
                     "content": (
                         "Refine this terminal task into a precise 1–2 sentence technical "
-                        "description. Do NOT generate a command yet.\n\n"
+                        "description tailored to the current system. Include relevant system "
+                        "details (OS, shell, architecture) where helpful. "
+                        "Do NOT generate a command yet.\n\n"
+                        f"System context:\n{_profile_ctx}\n\n"
                         f"Task: {user_in}"
                     ),
                 }],
@@ -562,18 +763,18 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
                     "3. Note any risks or side effects."
                 ),
             }],
-            "Claude",
+            "AI",
         )
         log("generated", text=gen_resp)
 
         command = extract_command(gen_resp)
         if not command:
-            console.print("[yellow]No command found in Claude's response.[/yellow]")
+            console.print("[yellow]No command found in AI response.[/yellow]")
             continue
 
         console.print(f"\n[bold]Command:[/bold] [cyan]{command}[/cyan]")
 
-        if args.dry_run:
+        if turn_args.dry_run:
             log("dry_run", command=command)
             console.print("[dim](dry-run — not executing)[/dim]")
             continue
@@ -591,9 +792,9 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
         success = False
         stdout  = ""
 
-        for attempt in range(args.max_retries + 1):
+        for attempt in range(turn_args.max_retries + 1):
             if attempt:
-                console.print(f"\n[yellow]Retry {attempt}/{args.max_retries}[/yellow]")
+                console.print(f"\n[yellow]Retry {attempt}/{turn_args.max_retries}[/yellow]")
 
             rc, stdout, stderr = execute(command)
             console.print(f"[dim]{'─' * 52}[/dim]")
@@ -606,7 +807,7 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
             log("exec_failed", command=command, rc=rc, attempt=attempt,
                 stderr=stderr[:500])
 
-            if attempt >= args.max_retries:
+            if attempt >= turn_args.max_retries:
                 console.print("[red]Max retries reached.[/red]")
                 break
 
@@ -623,7 +824,7 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
                         "Diagnose briefly, then provide a corrected ```bash command."
                     ),
                 }],
-                "Claude (fixing)",
+                "AI (fixing)",
             )
             log("fix_response", text=fix_resp)
 
@@ -681,9 +882,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--timeout",      type=int, default=120, metavar="SECS",
                    help="Subprocess timeout in seconds")
     p.add_argument("--reconfigure",  action="store_true",
-                   help="Re-run first-time setup")
+                   help="Re-run first-time setup (including provider selection)")
     p.add_argument("--stream-delay", type=int, default=0, metavar="MS",
                    help="Artificial token render delay in milliseconds")
+    p.add_argument("--provider",     choices=["claude", "ollama"], metavar="PROVIDER",
+                   help="Override provider for this session (claude or ollama)")
+    p.add_argument("--ollama-url",   metavar="URL",
+                   help=f"Ollama base URL (default: {DEFAULT_OLLAMA_URL})")
+    p.add_argument("--ollama-model", metavar="MODEL",
+                   help=f"Ollama model name (default: {DEFAULT_OLLAMA_MODEL})")
     return p.parse_args()
 
 
@@ -692,7 +899,8 @@ def main() -> None:
     cfg  = load_config()
 
     # ── Bootstrap if needed ──────────────────────────────────────────────────
-    if args.reconfigure or not cfg.get("first_run_complete"):
+    if (args.reconfigure or not cfg.get("first_run_complete")) and not os.environ.get("_TA_BOOTSTRAPPED"):
+        os.environ["_TA_BOOTSTRAPPED"] = "1"
         if args.reconfigure:
             cfg.pop("first_run_complete", None)
         run_bootstrap()
