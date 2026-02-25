@@ -12,6 +12,8 @@ An AI-powered terminal assistant that turns natural language task descriptions i
 - **Self-bootstrapping** — installs `uv`, Python 3.14t (free-threaded), and required dependencies on first run
 - **Multiple AI providers** — choose between Claude (Anthropic API) or Ollama (local inference)
 - **Inline flags** — control behaviour per-task by appending flags directly to your prompt
+- **Interactive command support** — TTY-requiring programs (`ssh`, `vim`, `top`, shells, REPLs, etc.) are detected automatically and handed a live terminal instead of being pipe-captured
+- **Remote self-deploy** — when an `ssh` command is confirmed, offers to copy itself to the remote server via `scp` so it's ready to use immediately after connecting
 
 ## Requirements
 
@@ -145,6 +147,38 @@ Execute? [Y/n]: y
 Summary:
   Successfully listed all files exceeding 100 MB in your home directory.
 ```
+
+## Interactive Commands
+
+Commands that require a live terminal — such as `ssh`, `sftp`, editors, pagers, monitors, REPLs, and shells — are detected automatically by their first token and executed directly on the terminal rather than through pipe capture:
+
+| Category | Commands |
+|----------|----------|
+| Remote access | `ssh`, `sftp`, `telnet`, `nc`, `ncat`, `ftp`, `lftp` |
+| Editors | `vim`, `vi`, `nvim`, `nano`, `emacs`, `pico`, `micro` |
+| Monitors | `top`, `htop`, `btop`, `atop`, `iotop` |
+| Pagers | `less`, `more`, `man` |
+| REPLs | `python`, `python3`, `ipython`, `psql`, `mysql`, `sqlite3`, `mongosh`, `redis-cli` |
+| Shells | `bash`, `sh`, `zsh`, `fish`, `ksh`, `dash` |
+
+The session return code is still captured for the retry/summary flow; stdout and stderr are left empty since the user interacted directly.
+
+## Remote Deploy
+
+Whenever an `ssh` command is confirmed for execution, the assistant asks whether to copy itself to the remote server first:
+
+```
+Command: ssh -i ~/ssh_hetzner root@46.225.184.38
+Execute? [Y/n]: y
+Deploy terminal assistant to root@46.225.184.38? [y/N]: y
+Copying main.py → root@46.225.184.38:~/terminal_assistant.py …
+Deployed. On the server run: python ~/terminal_assistant.py
+(interactive command — running directly on terminal)
+
+root@server:~# python ~/terminal_assistant.py
+```
+
+The identity file (`-i`) is reused automatically for the `scp` transfer. On the remote server the assistant runs its normal first-time bootstrap (installs `uv`, Python, venv, deps) before starting the REPL.
 
 ## Reconfiguring
 

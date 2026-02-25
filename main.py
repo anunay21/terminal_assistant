@@ -14,6 +14,7 @@ import os
 import platform
 import queue
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -573,10 +574,89 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
         m = _CMD_RE.search(text)
         return m.group(1).strip() if m else None
 
+    # ── Commands that require a live TTY and must not be pipe-captured ──────
+    _TTY_CMDS = frozenset({
+        "ssh", "sftp", "telnet", "nc", "ncat", "netcat",
+        "vim", "vi", "nvim", "nano", "emacs", "pico", "micro",
+        "top", "htop", "btop", "atop", "iotop",
+        "less", "more", "man",
+        "python", "python3", "ipython", "bpython",
+        "bash", "sh", "zsh", "fish", "ksh", "dash",
+        "psql", "mysql", "sqlite3", "mongosh", "redis-cli",
+        "ftp", "lftp",
+    })
+
+    def _needs_tty(cmd: str) -> bool:
+        """Return True if the command's first token is a known TTY-requiring program."""
+        first = cmd.strip().split()[0] if cmd.strip() else ""
+        return os.path.basename(first) in _TTY_CMDS
+
+    # Flags that consume the next token (so we can skip them while parsing)
+    _SSH_VALUE_FLAGS = {
+        "-i", "-l", "-p", "-o", "-b", "-c", "-D", "-e", "-E",
+        "-F", "-I", "-J", "-L", "-m", "-Q", "-R", "-S", "-W", "-w",
+    }
+
+    def _parse_ssh_target(cmd: str) -> tuple[str, str | None] | None:
+        """
+        Parse an ssh command and return (destination, identity_file) or None.
+        destination is the first non-flag token (user@host or host).
+        """
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            return None
+        if not parts or os.path.basename(parts[0]) != "ssh":
+            return None
+        identity: str | None = None
+        i = 1
+        while i < len(parts):
+            tok = parts[i]
+            if tok in _SSH_VALUE_FLAGS and i + 1 < len(parts):
+                if tok == "-i":
+                    identity = parts[i + 1]
+                i += 2
+            elif tok.startswith("-"):
+                i += 1
+            else:
+                return (tok, identity)
+        return None
+
+    def _deploy_assistant(destination: str, identity: str | None) -> bool:
+        """Copy this script to destination:~/terminal_assistant.py via scp."""
+        script = Path(__file__).resolve()
+        scp_cmd = ["scp"]
+        if identity:
+            scp_cmd += ["-i", identity]
+        scp_cmd += [str(script), f"{destination}:~/terminal_assistant.py"]
+        console.print(f"[dim]Copying {script.name} → {destination}:~/terminal_assistant.py …[/dim]")
+        rc = subprocess.call(scp_cmd)
+        if rc == 0:
+            console.print(
+                "[green]Deployed.[/green] On the server run: "
+                "[cyan]python ~/terminal_assistant.py[/cyan]"
+            )
+        else:
+            console.print("[yellow]Deploy failed — connecting anyway.[/yellow]")
+        return rc == 0
+
     # ── Thread 3 — Command execution ────────────────────────────────────────
     def execute(cmd: str) -> tuple[int, str, str]:
         """Run cmd in a subprocess; stream stdout/stderr live; return (rc, out, err)."""
         log("exec_start", command=cmd)
+
+        # Interactive / TTY commands: run directly on the terminal so the
+        # user gets a full interactive session (e.g. ssh, vim, top).
+        if _needs_tty(cmd):
+            console.print("[dim](interactive command — running directly on terminal)[/dim]")
+            try:
+                rc = subprocess.call(cmd, shell=True)
+            except Exception as exc:
+                console.print(f"[red]Failed to launch: {exc}[/red]")
+                rc = -1
+            log("exec_end", command=cmd, rc=rc, interactive=True)
+            return rc, "", ""
+
         out_lines: list[str] = []
         err_lines: list[str] = []
 
@@ -786,6 +866,17 @@ def run_app(args: argparse.Namespace, cfg: dict, profile: dict) -> None:
                 continue
         except (EOFError, KeyboardInterrupt):
             continue
+
+        # ── SSH: offer to deploy the assistant to the remote server ──────────
+        _ssh_target = _parse_ssh_target(command)
+        if _ssh_target:
+            _dest, _identity = _ssh_target
+            try:
+                dep = input(f"Deploy terminal assistant to {_dest}? [y/N]: ").strip().lower()
+                if dep in ("y", "yes"):
+                    _deploy_assistant(_dest, _identity)
+            except (EOFError, KeyboardInterrupt):
+                pass
 
         # ── Phase 3: Execution + error loop ─────────────────────────────────
         console.print(f"\n[dim]{'─' * 52}[/dim]")
